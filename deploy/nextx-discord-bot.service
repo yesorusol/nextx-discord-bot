@@ -1,0 +1,20 @@
+[Unit]
+Description=Next.X Discord work report bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bot
+WorkingDirectory=/opt/nextx-discord-bot
+EnvironmentFile=/opt/nextx-discord-bot/.env
+ExecStart=/usr/bin/node src/index.js
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/nextx-discord-bot/data
+
+[Install]
+WantedBy=multi-user.target
