@@ -1,0 +1,965 @@
+import fs from "node:fs";
+import path from "node:path";
+import { GoogleAuth } from "google-auth-library";
+import { formatSeoulNow, seoulDayKey } from "./format.js";
+import { guildStatePaths } from "./guilds.js";
+import { pickPerson } from "./match.js";
+import {
+  TASK_READ_LIMIT,
+  decideReviewerClose,
+  decideSaturatedClose,
+  gridOrigin,
+  lookupReviewerTask,
+  parseTaskSheet,
+} from "./reviewer-tasks.js";
+
+const LOG_HEADERS = [
+  "작성시각",
+  "보고유형",
+  "디스코드닉네임",
+  "역할",
+  "내용",
+  "메시지링크",
+  "보고일자",
+  "불참날짜",
+  "대체업무 진행날짜",
+];
+const ABSENCE_SHEET_TITLE = "업무불참";
+const ABSENCE_HEADERS = [
+  "작성시각",
+  "이름",
+  "역할",
+  "불참날짜",
+  "대체업무 진행날짜",
+  "불참사유",
+  "메시지링크",
+];
+const DASHBOARD_HEADERS = [
+  "직무",
+  "이름",
+  "현재 상태",
+  "출근시간",
+  "퇴근시간",
+  "판정 시각",
+  "정정 여부",
+  "불참 여부",
+];
+const ABSENT = "미출근";
+const FLUSH_WINDOW_MS = 60_000;
+const FLUSH_RETRY_MS = 60_000;
+const ROSTER_REFRESH_MS = 5 * 60_000;
+const TASK_READ_WINDOW_MS = 60_000;
+const TASK_REFRESH_DELAY_MS = 60_000;
+let sheetCallTimes = [];
+const DEFAULT_ROSTER = {
+  headerRow: 10,
+  nameIndex: 1,
+  jobIndex: 3,
+  statusIndex: 7,
+  activeStatus: "근무중",
+};
+
+function noteSheetCall(now = Date.now()) {
+  sheetCallTimes.push(now);
+}
+
+function sheetCallsInWindow(now = Date.now()) {
+  sheetCallTimes = sheetCallTimes.filter((time) => now - time < TASK_READ_WINDOW_MS);
+  return sheetCallTimes.length;
+}
+
+export function rosterPeopleFromSheet(values, roster = DEFAULT_ROSTER) {
+  const headerIndex = Number(roster.headerRow) - 1;
+  if (!Number.isInteger(headerIndex) || headerIndex < 0) {
+    return [];
+  }
+  const activeStatus = String(roster.activeStatus).replace(/\s+/g, "");
+  const people = new Map();
+  for (const row of values.slice(headerIndex + 1)) {
+    const name = String(row[roster.nameIndex] ?? "").trim();
+    const job = String(row[roster.jobIndex] ?? "").trim();
+    const employment = String(row[roster.statusIndex] ?? "").replace(/\s+/g, "");
+    if (!name || employment !== activeStatus || people.has(name)) {
+      continue;
+    }
+    people.set(name, { name, job });
+  }
+  return [...people.values()];
+}
+
+export function applyPeoplePatch(people, nickname, patch) {
+  const picked = pickPerson(nickname, people);
+  if (picked.status !== "found") {
+    return { status: picked.status, people };
+  }
+  return {
+    status: "updated",
+    people: people.map((person, index) => (index === picked.index ? { ...person, ...patch } : person)),
+  };
+}
+
+export function mergeDashboard(roster, current, { resetTimes, absentNames, now }) {
+  return roster.map((person) => {
+    const existing = current.find((row) => row.name === person.name);
+    if (!existing || resetTimes) {
+      const isAbsent = absentNames.has(person.name.toLowerCase());
+      return {
+        job: person.job,
+        name: person.name,
+        status: isAbsent ? "불참" : ABSENT,
+        clockIn: "-",
+        clockOut: "-",
+        judgedAt: isAbsent ? now : "-",
+        corrected: false,
+        absent: isAbsent,
+      };
+    }
+    if (absentNames.has(person.name.toLowerCase())) {
+      return {
+        ...existing,
+        job: person.job || existing.job,
+        name: person.name,
+        status: "불참",
+        judgedAt: existing.status === "불참" ? existing.judgedAt : now,
+        absent: true,
+      };
+    }
+    return { ...existing, job: person.job || existing.job, name: person.name };
+  });
+}
+
+export function createWorkbook(config) {
+  const roster = { ...DEFAULT_ROSTER, ...config.roster };
+  const logSpreadsheetId = config.spreadsheetId;
+  const dashboardSpreadsheetId = config.dashboardSpreadsheetId || logSpreadsheetId;
+  const absenceSpreadsheetId = config.absenceSpreadsheetId || logSpreadsheetId;
+  const { pendingPath, dayPath: statePath } = guildStatePaths(config.guildId || "default");
+  const auth = new GoogleAuth({
+    keyFile: config.serviceAccountPath,
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+  });
+  const titles = new Map();
+  const namedTitles = new Set();
+  const readyHeaders = new Set();
+  let chain = Promise.resolve();
+  let dashboardCache = [];
+  let todayAbsenceNames = new Set();
+  let absenceScheduleLoaded = false;
+  let dashboardReady = false;
+  let lastDashboardSize = null;
+  let rosterDirty = false;
+  let flushTimer = null;
+  let taskCache = { loaded: false, column: null, people: [], loadedAt: 0 };
+  let taskRefreshTimer = null;
+  let taskColumnWarned = false;
+  let taskSaturatedAt = 0;
+  const pending = { logs: [], absences: [], patches: [] };
+
+  loadPending();
+
+  function enqueue(task) {
+    const run = chain.then(task, task);
+    chain = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
+  }
+
+  function loadPending() {
+    if (!fs.existsSync(pendingPath)) {
+      return;
+    }
+    try {
+      const saved = JSON.parse(fs.readFileSync(pendingPath, "utf8"));
+      pending.logs = Array.isArray(saved.logs) ? saved.logs : [];
+      pending.absences = Array.isArray(saved.absences) ? saved.absences : [];
+      pending.patches = Array.isArray(saved.patches) ? saved.patches : [];
+    } catch (error) {
+      console.error("모아 둔 시트 기록을 읽지 못했습니다.", error);
+    }
+  }
+
+  function persistPending() {
+    fs.mkdirSync(path.dirname(pendingPath), { recursive: true });
+    fs.writeFileSync(
+      pendingPath,
+      JSON.stringify(
+        {
+          logs: pending.logs,
+          absences: pending.absences,
+          patches: pending.patches,
+        },
+        null,
+        2,
+      ),
+    );
+  }
+
+  function hasSheetWork() {
+    return pending.logs.length > 0 || pending.absences.length > 0 || pending.patches.length > 0 || rosterDirty;
+  }
+
+  function armFlush(delayMs) {
+    if (flushTimer) {
+      return;
+    }
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      enqueue(() => runFlush()).catch((error) => {
+        console.error("시트 일괄 기록 실패", error);
+        armFlush(FLUSH_RETRY_MS);
+      });
+    }, delayMs);
+    flushTimer.unref?.();
+  }
+
+  function rememberPendingAbsences(targetDate) {
+    for (const row of pending.absences) {
+      const name = String(row[1] ?? "").trim().toLowerCase();
+      if (name && String(row[3] ?? "").trim() === targetDate) {
+        todayAbsenceNames.add(name);
+      }
+    }
+  }
+
+  function applyToCache(nickname, patch) {
+    const result = applyPeoplePatch(dashboardCache, nickname, patch);
+    if (result.status === "updated") {
+      dashboardCache = result.people;
+    }
+    return result.status;
+  }
+
+  function replayPatches(people) {
+    let current = people;
+    for (const item of pending.patches) {
+      const result = applyPeoplePatch(current, item.nickname, item.patch);
+      if (result.status === "updated") {
+        current = result.people;
+      } else {
+        console.warn(`대시보드 닉네임 반영 안 됨: ${item.nickname} (${result.status})`);
+      }
+    }
+    return current;
+  }
+
+  async function request(spreadsheetId, suffix, options = {}) {
+    noteSheetCall();
+    const client = await auth.getClient();
+    const accessToken = await client.getAccessToken();
+    const response = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}${suffix}`, {
+      ...options,
+      headers: {
+        Authorization: `Bearer ${accessToken.token}`,
+        "Content-Type": "application/json",
+      },
+    });
+    const text = await response.text();
+    const body = text ? JSON.parse(text) : null;
+    if (!response.ok) {
+      throw new Error(body?.error?.message ?? `구글 시트 요청 실패 (${response.status})`);
+    }
+    return body;
+  }
+
+  function rangeOf(title, a1) {
+    return encodeURIComponent(`'${title.replaceAll("'", "''")}'!${a1}`);
+  }
+
+  async function sheetTitle(spreadsheetId, sheetId) {
+    const key = `${spreadsheetId}:${sheetId}`;
+    if (titles.has(key)) {
+      return titles.get(key);
+    }
+    const metadata = await request(spreadsheetId, "?fields=sheets.properties");
+    const sheet = metadata.sheets?.find((item) => item.properties.sheetId === sheetId);
+    if (!sheet) {
+      throw new Error(`시트 gid ${sheetId}를 찾지 못했습니다.`);
+    }
+    titles.set(key, sheet.properties.title);
+    return sheet.properties.title;
+  }
+
+  async function ensureSheetByTitle(spreadsheetId, title) {
+    const key = `${spreadsheetId}:${title}`;
+    if (namedTitles.has(key)) {
+      return title;
+    }
+    const metadata = await request(spreadsheetId, "?fields=sheets.properties.title");
+    const exists = metadata.sheets?.some((sheet) => sheet.properties.title === title);
+    if (!exists) {
+      await request(spreadsheetId, ":batchUpdate", {
+        method: "POST",
+        body: JSON.stringify({
+          requests: [{ addSheet: { properties: { title } } }],
+        }),
+      });
+    }
+    namedTitles.add(key);
+    return title;
+  }
+
+  async function readValues(spreadsheetId, title, a1) {
+    const body = await request(spreadsheetId, `/values/${rangeOf(title, a1)}`);
+    return body.values ?? [];
+  }
+
+  async function writeValues(spreadsheetId, title, a1, values) {
+    await request(spreadsheetId, `/values/${rangeOf(title, a1)}?valueInputOption=RAW`, {
+      method: "PUT",
+      body: JSON.stringify({ values }),
+    });
+  }
+
+  async function clearValues(spreadsheetId, title, a1) {
+    await request(spreadsheetId, `/values/${rangeOf(title, a1)}:clear`, { method: "POST", body: "{}" });
+  }
+
+  async function ensureHeader(spreadsheetId, title, headers, a1, headerKey) {
+    if (readyHeaders.has(headerKey)) {
+      return;
+    }
+    const rows = await readValues(spreadsheetId, title, a1);
+    const current = rows[0] ?? [];
+    const matches = headers.every((header, index) => current[index] === header);
+    if (!matches) {
+      await writeValues(spreadsheetId, title, a1, [headers]);
+    }
+    readyHeaders.add(headerKey);
+  }
+
+  async function formatDashboard() {
+    await request(dashboardSpreadsheetId, ":batchUpdate", {
+      method: "POST",
+      body: JSON.stringify({
+        requests: [
+          {
+            repeatCell: {
+              range: {
+                sheetId: config.dashboardSheetId,
+                startRowIndex: 1,
+                startColumnIndex: 6,
+                endColumnIndex: 8,
+              },
+              cell: {
+                dataValidation: {
+                  condition: { type: "BOOLEAN" },
+                  strict: true,
+                  showCustomUi: true,
+                },
+              },
+              fields: "dataValidation",
+            },
+          },
+          {
+            repeatCell: {
+              range: {
+                sheetId: config.dashboardSheetId,
+                startColumnIndex: 0,
+                endColumnIndex: 9,
+              },
+              cell: {
+                userEnteredFormat: {
+                  horizontalAlignment: "CENTER",
+                },
+              },
+              fields: "userEnteredFormat.horizontalAlignment",
+            },
+          },
+        ],
+      }),
+    });
+  }
+
+  function readDay() {
+    if (!fs.existsSync(statePath)) {
+      return null;
+    }
+    return JSON.parse(fs.readFileSync(statePath, "utf8")).date ?? null;
+  }
+
+  function writeDay(date) {
+    fs.mkdirSync(path.dirname(statePath), { recursive: true });
+    fs.writeFileSync(statePath, JSON.stringify({ date }, null, 2));
+  }
+
+  function dashboardRows(values) {
+    return values
+      .slice(1)
+      .map((row) => ({
+        job: String(row[0] ?? "").trim(),
+        name: String(row[1] ?? "").trim(),
+        status: String(row[2] ?? "").trim() || ABSENT,
+        clockIn: String(row[3] ?? "").trim() || "-",
+        clockOut: String(row[4] ?? "").trim() || "-",
+        judgedAt: String(row[5] ?? "").trim() || "-",
+        corrected: row[6] === true || String(row[6] ?? "").toUpperCase() === "TRUE",
+        absent: row[7] === true || String(row[7] ?? "").toUpperCase() === "TRUE",
+      }))
+      .filter((person) => person.name);
+  }
+
+  function toCells(person) {
+    return [
+      person.job,
+      person.name,
+      person.status,
+      person.clockIn,
+      person.clockOut,
+      person.judgedAt,
+      Boolean(person.corrected),
+      Boolean(person.absent),
+    ];
+  }
+
+  function clonePeople(people) {
+    return people.map((person) => ({ ...person }));
+  }
+
+  async function readDashboardSheet() {
+    const dashboardTitle = await sheetTitle(dashboardSpreadsheetId, config.dashboardSheetId);
+    await ensureHeader(dashboardSpreadsheetId, dashboardTitle, DASHBOARD_HEADERS, "A1:H1", "dashboard");
+    return dashboardRows(await readValues(dashboardSpreadsheetId, dashboardTitle, "A:H"));
+  }
+
+  async function loadRoster() {
+    const body = await request(config.rosterSpreadsheetId, "/values:batchGetByDataFilter", {
+      method: "POST",
+      body: JSON.stringify({
+        dataFilters: [
+          {
+            gridRange: {
+              sheetId: config.rosterSheetId,
+              startColumnIndex: 0,
+              endColumnIndex: Math.max(roster.nameIndex, roster.jobIndex, roster.statusIndex) + 1,
+            },
+          },
+        ],
+        majorDimension: "ROWS",
+      }),
+    });
+    const values = body.valueRanges?.[0]?.valueRange?.values ?? [];
+    return rosterPeopleFromSheet(values, roster);
+  }
+
+  async function writeDashboard(people) {
+    const dashboardTitle = await sheetTitle(dashboardSpreadsheetId, config.dashboardSheetId);
+    await ensureHeader(dashboardSpreadsheetId, dashboardTitle, DASHBOARD_HEADERS, "A1:H1", "dashboard");
+    await writeValues(dashboardSpreadsheetId, dashboardTitle, `A1:H${Math.max(people.length + 1, 1)}`, [
+      DASHBOARD_HEADERS,
+      ...people.map(toCells),
+    ]);
+    await formatDashboard();
+    if (lastDashboardSize === null || people.length < lastDashboardSize) {
+      await clearValues(dashboardSpreadsheetId, dashboardTitle, `A${people.length + 2}:H1000`);
+    }
+    lastDashboardSize = people.length;
+    await refreshDashboardFilter(people.length);
+  }
+
+  async function refreshDashboardFilter(rowCount) {
+    try {
+      const metadata = await request(
+        dashboardSpreadsheetId,
+        "?fields=sheets(properties.sheetId,basicFilter(range,sortSpecs,criteria,filterSpecs))",
+      );
+      const sheet = metadata.sheets?.find((item) => item.properties.sheetId === config.dashboardSheetId);
+      const filter = sheet?.basicFilter;
+      if (!filter) {
+        return;
+      }
+      const range = {
+        sheetId: config.dashboardSheetId,
+        startRowIndex: filter.range?.startRowIndex ?? 0,
+        endRowIndex: Math.max(filter.range?.endRowIndex ?? 0, rowCount + 1),
+        startColumnIndex: filter.range?.startColumnIndex ?? 0,
+        endColumnIndex: Math.max(filter.range?.endColumnIndex ?? 0, 8),
+      };
+      await request(dashboardSpreadsheetId, ":batchUpdate", {
+        method: "POST",
+        body: JSON.stringify({
+          requests: [
+            { clearBasicFilter: { sheetId: config.dashboardSheetId } },
+            {
+              setBasicFilter: {
+                filter: {
+                  range,
+                  ...(filter.sortSpecs ? { sortSpecs: filter.sortSpecs } : {}),
+                  ...(filter.criteria ? { criteria: filter.criteria } : {}),
+                  ...(filter.filterSpecs ? { filterSpecs: filter.filterSpecs } : {}),
+                },
+              },
+            },
+          ],
+        }),
+      });
+    } catch (error) {
+      console.error("대시보드 필터를 다시 적용하지 못했습니다.", error);
+    }
+  }
+
+  async function syncRoster(resetTimes, { write }) {
+    const roster = await loadRoster();
+    const current = dashboardCache.length > 0 ? dashboardCache : await readDashboardSheet();
+    const before = JSON.stringify(dashboardCache);
+    dashboardCache = replayPatches(
+      mergeDashboard(roster, current, {
+        resetTimes,
+        absentNames: todayAbsenceNames,
+        now: formatSeoulNow(),
+      }),
+    );
+    if (JSON.stringify(dashboardCache) !== before) {
+      rosterDirty = true;
+    }
+    if (write) {
+      await writeDashboard(clonePeople(dashboardCache));
+      if (pending.patches.length === 0) {
+        rosterDirty = false;
+      }
+    }
+  }
+
+  async function appendRows(spreadsheetId, title, headerKey, headers, headerRange, columns, rows) {
+    await ensureHeader(spreadsheetId, title, headers, headerRange, headerKey);
+    await request(
+      spreadsheetId,
+      `/values/${rangeOf(title, columns)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`,
+      { method: "POST", body: JSON.stringify({ values: rows }) },
+    );
+  }
+
+  async function writeQueuedLogs() {
+    const rows = pending.logs.slice();
+    if (!rows.length) {
+      return 0;
+    }
+    const title = await sheetTitle(logSpreadsheetId, config.logSheetId);
+    await appendRows(logSpreadsheetId, title, "log", LOG_HEADERS, "A1:I1", "A:I", rows);
+    pending.logs.splice(0, rows.length);
+    persistPending();
+    return rows.length;
+  }
+
+  async function writeQueuedAbsences() {
+    if (config.absenceSheetId == null || config.absenceSheetId === "") {
+      return 0;
+    }
+    const rows = pending.absences.slice();
+    if (!rows.length) {
+      return 0;
+    }
+    const title = await absenceTitle();
+    await appendRows(absenceSpreadsheetId, title, "absence", ABSENCE_HEADERS, "A1:G1", "A:G", rows);
+    pending.absences.splice(0, rows.length);
+    persistPending();
+    return rows.length;
+  }
+
+  async function writeQueuedDashboard() {
+    if (pending.patches.length === 0 && !rosterDirty) {
+      return false;
+    }
+    if (dashboardCache.length === 0) {
+      throw new Error("대시보드 명단을 불러오기 전에 출근부를 저장할 수 없습니다.");
+    }
+    const patchCount = pending.patches.length;
+    await writeDashboard(clonePeople(dashboardCache));
+    pending.patches.splice(0, patchCount);
+    if (pending.patches.length === 0) {
+      rosterDirty = false;
+    }
+    persistPending();
+    return true;
+  }
+
+  function queuedPeople() {
+    const names = [
+      ...pending.logs.map((row) => row[2]),
+      ...pending.absences.map((row) => row[1]),
+      ...pending.patches.map((item) => item.nickname),
+    ];
+    return [...new Set(names.map((name) => String(name ?? "").trim()).filter(Boolean))];
+  }
+
+  async function flushPending() {
+    if (!hasSheetWork()) {
+      return { ok: true, logCount: 0, absenceCount: 0, dashboardWritten: false };
+    }
+    const people = queuedPeople();
+    const peopleText = people.length > 0 ? ` 대상: ${people.join(", ")}` : "";
+    let logCount = 0;
+    let absenceCount = 0;
+    let dashboardWritten = false;
+    try {
+      logCount = await writeQueuedLogs();
+      absenceCount = await writeQueuedAbsences();
+      dashboardWritten = await writeQueuedDashboard();
+    } catch (error) {
+      console.error(`시트 일괄 기록 실패${peopleText}`, error);
+      return { ok: false, logCount, absenceCount, dashboardWritten };
+    }
+    const parts = [`로그 ${logCount}건`, `불참 ${absenceCount}건`];
+    if (dashboardWritten) {
+      parts.push("대시보드 갱신");
+    }
+    console.log(`시트 일괄 기록: ${parts.join(", ")}${peopleText}`);
+    return { ok: true, logCount, absenceCount, dashboardWritten };
+  }
+
+  async function runFlush() {
+    const result = await flushPending();
+    if (!result.ok) {
+      armFlush(FLUSH_RETRY_MS);
+      return;
+    }
+    if (hasSheetWork()) {
+      armFlush(FLUSH_WINDOW_MS);
+    }
+  }
+
+  async function absenceTitle() {
+    if (config.absenceSheetId == null || config.absenceSheetId === "") {
+      return ensureSheetByTitle(absenceSpreadsheetId, ABSENCE_SHEET_TITLE);
+    }
+    return sheetTitle(absenceSpreadsheetId, Number(config.absenceSheetId));
+  }
+
+  async function refreshAbsenceSchedule(targetDate) {
+    if (config.absenceSheetId == null || config.absenceSheetId === "") {
+      return;
+    }
+    const title = await absenceTitle();
+    await ensureHeader(absenceSpreadsheetId, title, ABSENCE_HEADERS, "A1:G1", "absence");
+    const rows = await readValues(absenceSpreadsheetId, title, "A:G");
+    const entries = rows.slice(1);
+    const active = entries.filter((row) => {
+      const absenceDate = String(row[3] ?? "").trim();
+      return !absenceDate || absenceDate >= targetDate;
+    });
+
+    if (active.length !== entries.length) {
+      await writeValues(absenceSpreadsheetId, title, `A1:G${active.length + 1}`, [ABSENCE_HEADERS, ...active]);
+      await clearValues(absenceSpreadsheetId, title, `A${active.length + 2}:G${entries.length + 1}`);
+    }
+
+    todayAbsenceNames = new Set(
+      active
+        .filter((row) => String(row[3] ?? "").trim() === targetDate)
+        .map((row) => String(row[1] ?? "").trim().toLowerCase())
+        .filter(Boolean),
+    );
+    rememberPendingAbsences(targetDate);
+    absenceScheduleLoaded = true;
+  }
+
+  async function publishCachedDashboard() {
+    if (hasSheetWork()) {
+      if (!((await flushPending()).ok)) {
+        armFlush(FLUSH_RETRY_MS);
+        return;
+      }
+      if (hasSheetWork()) {
+        armFlush(FLUSH_WINDOW_MS);
+      }
+      return;
+    }
+    if (!rosterDirty) {
+      return;
+    }
+    try {
+      await writeDashboard(clonePeople(dashboardCache));
+      rosterDirty = false;
+    } catch (error) {
+      console.error("대시보드 명단 갱신 실패", error);
+      armFlush(FLUSH_RETRY_MS);
+    }
+  }
+
+  async function catchUpDay() {
+    const today = seoulDayKey();
+    const saved = readDay();
+    const todayLabel = today.replaceAll("-", ".");
+    const loadedNow = !dashboardReady;
+    if (loadedNow) {
+      if (saved !== null && saved !== today) {
+        dashboardCache = replayPatches(await readDashboardSheet());
+        if (dashboardCache.length === 0) {
+          if (!absenceScheduleLoaded) {
+            await refreshAbsenceSchedule(todayLabel);
+          }
+          await syncRoster(false, { write: false });
+        }
+        rosterDirty =
+          rosterDirty || pending.logs.length > 0 || pending.absences.length > 0 || pending.patches.length > 0;
+      } else {
+        if (!absenceScheduleLoaded) {
+          await refreshAbsenceSchedule(todayLabel);
+        }
+        await syncRoster(false, { write: false });
+      }
+      dashboardReady = true;
+    }
+
+    if (saved !== null && saved !== today) {
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      if (hasSheetWork() && !((await flushPending()).ok)) {
+        console.error("모아 둔 시트 기록을 마치지 못해 자정 초기화를 미뤘습니다.");
+        armFlush(FLUSH_RETRY_MS);
+        return;
+      }
+      await refreshAbsenceSchedule(todayLabel);
+      await syncRoster(true, { write: true });
+      writeDay(today);
+      console.log("자정이 지나 출근·퇴근 시각을 비웠습니다.");
+      if (hasSheetWork() && !((await flushPending()).ok)) {
+        armFlush(FLUSH_RETRY_MS);
+      } else if (hasSheetWork()) {
+        armFlush(FLUSH_WINDOW_MS);
+      }
+      return;
+    }
+
+    if (loadedNow) {
+      await publishCachedDashboard();
+      if (saved !== today) {
+        writeDay(today);
+        console.log("대시보드 명단을 채웠습니다.");
+      }
+    }
+  }
+
+  async function refreshRoster() {
+    if (!dashboardReady) {
+      return;
+    }
+    await refreshAbsenceSchedule(seoulDayKey().replaceAll("-", "."));
+    await syncRoster(false, { write: false });
+    if (!rosterDirty) {
+      return;
+    }
+    if (flushTimer || pending.logs.length > 0 || pending.absences.length > 0 || pending.patches.length > 0) {
+      armFlush(FLUSH_WINDOW_MS);
+      return;
+    }
+    try {
+      await writeDashboard(clonePeople(dashboardCache));
+      rosterDirty = false;
+    } catch (error) {
+      console.error("대시보드 명단 갱신 실패", error);
+      armFlush(FLUSH_RETRY_MS);
+    }
+  }
+
+  function clearTaskRefresh() {
+    if (!taskRefreshTimer) {
+      return;
+    }
+    clearTimeout(taskRefreshTimer);
+    taskRefreshTimer = null;
+  }
+
+  function scheduleTaskRefresh() {
+    if (taskRefreshTimer) {
+      return;
+    }
+    taskRefreshTimer = setTimeout(() => {
+      taskRefreshTimer = null;
+      enqueue(() => loadReviewerTasks()).catch((error) => {
+        console.error("리뷰어 작업 현황 갱신 실패", error);
+      });
+    }, TASK_REFRESH_DELAY_MS);
+    taskRefreshTimer.unref?.();
+  }
+
+  async function loadReviewerTasks() {
+    const body = await request(config.taskSpreadsheetId, "/values:batchGetByDataFilter", {
+      method: "POST",
+      body: JSON.stringify({
+        dataFilters: [
+          {
+            gridRange: {
+              sheetId: config.taskSheetId,
+              startColumnIndex: 15,
+              endColumnIndex: 24,
+            },
+          },
+        ],
+        majorDimension: "ROWS",
+      }),
+    });
+    const valueRange = body.valueRanges?.[0]?.valueRange ?? {};
+    const origin = gridOrigin(valueRange.range);
+    taskCache = parseTaskSheet(valueRange.values ?? [], {
+      startRow: origin.startRow,
+      startColumn: origin.startColumn,
+      today: seoulDayKey(),
+    });
+    taskCache.loadedAt = Date.now();
+    clearTaskRefresh();
+    if (taskCache.column == null && !taskColumnWarned) {
+      taskColumnWarned = true;
+      console.error("리뷰어 작업 시트에서 오늘 날짜 열을 찾지 못했습니다.");
+    }
+  }
+
+  function taskCacheFresh(now = Date.now()) {
+    return taskCache.loaded && now - taskCache.loadedAt < TASK_READ_WINDOW_MS;
+  }
+
+  async function reviewClose(nickname) {
+    const status = lookupReviewerTask(taskCache, nickname);
+    const reads = sheetCallsInWindow();
+    if (reads >= TASK_READ_LIMIT) {
+      if (!taskSaturatedAt) {
+        taskSaturatedAt = Date.now();
+      }
+      const saturated = decideSaturatedClose({
+        status,
+        cacheLoadedAt: taskCache.loadedAt,
+        limitMarkedAt: taskSaturatedAt,
+        refreshPending: Boolean(taskRefreshTimer),
+      });
+      if (saturated === "retry") {
+        scheduleTaskRefresh();
+        return "retry";
+      }
+      return saturated;
+    }
+    taskSaturatedAt = 0;
+    const decision = decideReviewerClose({
+      status,
+      readsInWindow: sheetCallsInWindow(),
+      cacheFresh: taskCacheFresh(),
+      limit: TASK_READ_LIMIT,
+    });
+    if (decision === "retry") {
+      scheduleTaskRefresh();
+      return "retry";
+    }
+    if (decision !== "refresh") {
+      return decision;
+    }
+    try {
+      await loadReviewerTasks();
+    } catch (error) {
+      console.error(`리뷰어 작업 현황을 읽지 못했습니다. ${nickname}`, error);
+      return status === "pending" ? "block" : "allow";
+    }
+    const next = lookupReviewerTask(taskCache, nickname);
+    if (next === "missing") {
+      return "missing";
+    }
+    return next === "pending" ? "block" : "allow";
+  }
+
+  return {
+    isDashboardReady() {
+      return dashboardReady;
+    },
+    roleForNickname(nickname) {
+      const picked = pickPerson(nickname, dashboardCache);
+      return picked.status === "found" ? dashboardCache[picked.index].job : null;
+    },
+    checkReviewerClose(nickname) {
+      if (!config.taskSpreadsheetId) {
+        return Promise.resolve("allow");
+      }
+      return enqueue(() => reviewClose(nickname));
+    },
+    reloadRoster() {
+      return enqueue(async () => {
+        let rosterOk = false;
+        let tasksOk = !config.taskSpreadsheetId;
+        try {
+          await refreshAbsenceSchedule(seoulDayKey().replaceAll("-", "."));
+          await syncRoster(false, { write: true });
+          dashboardReady = true;
+          rosterOk = true;
+        } catch (error) {
+          console.error("원본 명단 갱신 실패", error);
+          if (rosterDirty) {
+            armFlush(FLUSH_RETRY_MS);
+          }
+        }
+        if (config.taskSpreadsheetId) {
+          try {
+            await loadReviewerTasks();
+            tasksOk = true;
+          } catch (error) {
+            console.error("리뷰어 작업 현황 갱신 실패", error);
+          }
+        }
+        return { ok: rosterOk, tasksOk, count: dashboardCache.length };
+      });
+    },
+    flushNow() {
+      return enqueue(async () => {
+        if (!dashboardReady || dashboardCache.length === 0) {
+          return { ok: false, reason: "loading" };
+        }
+        if (flushTimer) {
+          clearTimeout(flushTimer);
+          flushTimer = null;
+        }
+        rosterDirty = true;
+        const result = await flushPending();
+        if (!result.ok) {
+          armFlush(FLUSH_RETRY_MS);
+          return { ok: false, reason: "failed" };
+        }
+        if (hasSheetWork()) {
+          armFlush(FLUSH_WINDOW_MS);
+        }
+        return { ok: true, ...result };
+      });
+    },
+    noteReport({ logRow, absenceRow, nickname, patch }) {
+      let attendance = "skipped";
+      if (patch) {
+        attendance = applyToCache(nickname, patch);
+        if (attendance === "updated") {
+          pending.patches.push({ nickname, patch: { ...patch } });
+        }
+      }
+      if (logRow) {
+        pending.logs.push(logRow);
+      }
+      if (absenceRow) {
+        pending.absences.push(absenceRow);
+        const name = String(absenceRow[1] ?? "").trim().toLowerCase();
+        const absenceDate = String(absenceRow[3] ?? "").trim();
+        if (name && absenceDate === seoulDayKey().replaceAll("-", ".")) {
+          todayAbsenceNames.add(name);
+        }
+      }
+      try {
+        persistPending();
+      } catch (error) {
+        console.error("모아 둔 시트 기록을 저장하지 못했습니다.", error);
+      }
+      armFlush(FLUSH_WINDOW_MS);
+      return attendance;
+    },
+    startDayWatcher() {
+      const tick = () => {
+        enqueue(() => catchUpDay()).catch((error) => console.error("대시보드 날짜 갱신 실패", error));
+      };
+      tick();
+      const dayTimer = setInterval(tick, 30_000);
+      dayTimer.unref?.();
+      const rosterTimer = setInterval(() => {
+        enqueue(() => refreshRoster()).catch((error) => console.error("대시보드 명단 갱신 실패", error));
+      }, ROSTER_REFRESH_MS);
+      rosterTimer.unref?.();
+      return () => {
+        clearInterval(dayTimer);
+        clearInterval(rosterTimer);
+      };
+    },
+  };
+}
